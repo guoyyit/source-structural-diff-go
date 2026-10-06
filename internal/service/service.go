@@ -25,6 +25,9 @@ type ProgressEvent struct {
 	Total    int           // total files discovered
 	Duration time.Duration // parse duration for "file"/"slow"
 	Baseline string        // baseline ID for "commit"
+	// Reused is true when the file model came from the previous
+	// baseline or the content cache instead of being re-parsed.
+	Reused bool
 }
 
 // ProgressFunc receives progress events; it may be nil.
@@ -171,7 +174,11 @@ type fileResult struct {
 // buildTree scans root and builds a tree model, reusing models from
 // prev and from the content cache whenever the token hash matches.
 // Parsing runs on a bounded worker pool; ctx cancellation aborts the
-// build without leaving any partial state behind.
+// build without leaving any partial state behind. Every goroutine
+// started here is fully reclaimed before buildTree returns, including
+// on error and cancellation paths: workers stop sending as soon as
+// ctx is done, and the collector drains results until the channel is
+// closed instead of returning early.
 func (s *Service) buildTree(ctx context.Context, root string, prev *model.TreeModel) (*model.TreeModel, error) {
 	files, err := syntax.ListGoFiles(root)
 	if err != nil {
@@ -187,16 +194,9 @@ func (s *Service) buildTree(ctx context.Context, root string, prev *model.TreeMo
 	cache := s.store.Cache()
 
 	var wg sync.WaitGroup
-	for i := 0; i < s.opts.Workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for path := range jobs {
-				results <- s.processFile(ctx, root, path, prev, cache)
-			}
-		}()
-	}
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		defer close(jobs)
 		for _, f := range files {
 			select {
@@ -206,6 +206,20 @@ func (s *Service) buildTree(ctx context.Context, root string, prev *model.TreeMo
 			}
 		}
 	}()
+	for i := 0; i < s.opts.Workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				res := s.processFile(ctx, root, path, prev, cache)
+				select {
+				case results <- res:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 	go func() {
 		wg.Wait()
 		close(results)
@@ -213,23 +227,32 @@ func (s *Service) buildTree(ctx context.Context, root string, prev *model.TreeMo
 
 	tree := &model.TreeModel{Files: map[string]*model.FileModel{}}
 	done := 0
+	var firstErr error
 	for res := range results {
-		done++
+		if firstErr != nil {
+			continue // draining so workers never block on a send
+		}
 		if res.err != nil {
+			firstErr = res.err
 			cancel()
-			return nil, res.err
+			continue
 		}
 		if err := ctx.Err(); err != nil {
+			firstErr = err
 			cancel()
-			return nil, err
+			continue
 		}
+		done++
 		tree.Files[res.fm.Path] = res.fm
-		ev := ProgressEvent{Kind: "file", Path: res.fm.Path, Done: done, Total: len(files), Duration: res.duration}
+		ev := ProgressEvent{Kind: "file", Path: res.fm.Path, Done: done, Total: len(files), Duration: res.duration, Reused: !res.parsed}
 		s.report(ev)
 		if res.parsed && res.duration > s.opts.SlowFileThreshold {
 			ev.Kind = "slow"
 			s.report(ev)
 		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

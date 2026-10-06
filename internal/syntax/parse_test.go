@@ -1,6 +1,9 @@
 package syntax
 
 import (
+	"reflect"
+
+	"github.com/guoyyit/source-structural-diff-go/internal/model"
 	"testing"
 )
 
@@ -111,5 +114,54 @@ func Bar(x int) int { return x * 2 }
 	}
 	if f1.Decls[0].ExactHash == f2.Decls[0].ExactHash {
 		t.Fatal("exact hash must change across rename")
+	}
+}
+
+func TestRedundantParensInvariant(t *testing.T) {
+	variants := []string{
+		"package p\nfunc F(a, b, c int) int {\n\ts := a + b\n\tif s > c {\n\t\treturn s\n\t}\n\treturn -s\n}\n",
+		// Redundant parens around the whole expression and sub-expressions.
+		"package p\nfunc F(a, b, c int) int {\n\ts := (a + b)\n\tif (s > c) {\n\t\treturn (s)\n\t}\n\treturn (-s)\n}\n",
+		// Nested / multi-level redundant parens plus reformatting.
+		"package p\n\nfunc F( a, b, c int ) int {\n\ts := ((a) + ((b))) // comment\n\tif ((s > c)) {\n\t\treturn ((s))\n\t}\n\treturn ((-s))\n}\n",
+	}
+	var first *model.FileModel
+	for i, src := range variants {
+		fm, err := ParseFile("a.go", []byte(src))
+		if err != nil {
+			t.Fatalf("variant %d: %v", i, err)
+		}
+		if len(fm.Decls) != 1 {
+			t.Fatalf("variant %d: want 1 decl, got %d", i, len(fm.Decls))
+		}
+		if first == nil {
+			first = fm
+			continue
+		}
+		d0, d1 := first.Decls[0], fm.Decls[0]
+		if d0.ExactHash != d1.ExactHash {
+			t.Errorf("variant %d: exact hash changed by redundant parens", i)
+		}
+		if d0.ShapeHash != d1.ShapeHash {
+			t.Errorf("variant %d: shape hash changed by redundant parens", i)
+		}
+		if !reflect.DeepEqual(d0.TokenHist, d1.TokenHist) {
+			t.Errorf("variant %d: token histogram changed by redundant parens", i)
+		}
+	}
+}
+
+func TestSemanticParensStillDetected(t *testing.T) {
+	// Parentheses that change evaluation order must still be visible.
+	a, err := ParseFile("a.go", []byte("package p\nfunc F() int { return 2 * 3 + 4 }\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ParseFile("a.go", []byte("package p\nfunc F() int { return 2 * (3 + 4) }\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Decls[0].ExactHash == b.Decls[0].ExactHash {
+		t.Fatal("semantic parentheses must change the exact hash")
 	}
 }

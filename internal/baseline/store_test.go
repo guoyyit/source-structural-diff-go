@@ -1,6 +1,7 @@
 package baseline
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -126,5 +127,42 @@ func TestCacheRoundTrip(t *testing.T) {
 	got := c.Get("h1")
 	if got == nil || got.Path != "a.go" || got.Decls[0].ExactHash != "x" {
 		t.Fatalf("cache round trip failed: %+v", got)
+	}
+}
+
+func TestCacheVersionIsolatesStaleEntries(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A stale entry written at the pre-versioning cache location must
+	// never be served by the current cache.
+	stale := &model.FileModel{Path: "old.go", Hash: "h1", Package: "p"}
+	data, _ := json.Marshal(stale)
+	if err := os.WriteFile(filepath.Join(dir, "cache", "h1.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Cache().Get("h1"); got != nil {
+		t.Fatalf("stale cache entry served: %+v", got)
+	}
+	// Current-version entries still round-trip.
+	fm := &model.FileModel{Path: "a.go", Hash: "h2", Package: "p"}
+	if err := s.Cache().Put("h2", fm); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Cache().Get("h2"); got == nil || got.Path != "a.go" {
+		t.Fatalf("versioned cache round trip failed: %+v", got)
+	}
+	// Temp residue inside the versioned cache dir is cleaned on Open.
+	tmp := filepath.Join(dir, "cache", cacheSchemaVersion, "junk.tmp7")
+	if err := os.WriteFile(tmp, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatal("nested cache temp file not cleaned")
 	}
 }

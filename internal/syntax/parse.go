@@ -230,13 +230,21 @@ func receiverTypeName(expr ast.Expr) string {
 
 // dumpHash emits a canonical pre-order serialization of the AST and
 // hashes it. Positions never appear in the dump, so formatting cannot
-// affect the result. Identifiers whose name is in normalize are
-// replaced by a placeholder. When tokHist / identSet are non-nil they
-// are filled with the feature profile used for similarity scoring.
+// affect the result. ParenExpr nodes are transparent: parentheses only
+// restate the grouping already encoded by the tree shape, so adding or
+// removing redundant (or nested) parentheses never changes the dump,
+// while parentheses that alter the parse still change the surrounding
+// node sequence. Identifiers whose name is in normalize are replaced
+// by a placeholder. When tokHist / identSet are non-nil they are
+// filled with the feature profile used for similarity scoring.
 func dumpHash(node ast.Node, normalize map[string]bool, tokHist, identSet map[string]int) string {
 	h := sha256.New()
 	ast.Inspect(node, func(n ast.Node) bool {
 		if n == nil {
+			return true
+		}
+		if _, isParen := n.(*ast.ParenExpr); isParen {
+			// Skip the node itself but still descend into it.
 			return true
 		}
 		switch x := n.(type) {

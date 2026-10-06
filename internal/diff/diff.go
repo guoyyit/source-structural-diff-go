@@ -2,6 +2,7 @@
 package diff
 
 import (
+	"fmt"
 	"math"
 	"sort"
 
@@ -38,6 +39,9 @@ type Entry struct {
 	Confidence float64    `json:"confidence,omitempty"`
 	Evidence   []Evidence `json:"evidence,omitempty"`
 	Candidate  bool       `json:"candidate,omitempty"`
+	// Note explains, for candidates, why the evidence is insufficient
+	// for an automatic rename/move conclusion.
+	Note string `json:"note,omitempty"`
 }
 
 // Report is the full, deterministically ordered diff result.
@@ -217,6 +221,10 @@ func (d *differ) addMatch(p pair) {
 		e.Category = Renamed
 		e.OldName = symbolName(p.old)
 	}
+	if candidate {
+		e.Note = fmt.Sprintf("insufficient structural evidence for automatic %s: confidence %.2f below threshold %.2f; manual review advised",
+			e.Category, round4(p.score), d.opts.MatchThreshold)
+	}
 	d.add(e)
 }
 
@@ -262,43 +270,89 @@ func symbolName(d model.Declaration) string {
 }
 
 // similarity scores how likely two declarations are the same symbol.
-// Name equality alone is deliberately weak: structurally unrelated
-// same-name symbols must never reach the match threshold.
+//
+// The score combines several independent evidence kinds, then gates the
+// result on coverage: the smaller of the two declarations (in AST node
+// count) bounds how much evidence can exist at all, so thin symbols can
+// never reach the match threshold. Shape equality alone is therefore
+// not sufficient for a high-confidence conclusion — a tiny empty
+// function matches every other tiny empty function's shape.
+//
+//	coverage  = min(1, minNodeCount / fullCoverageNodes)
+//	cap       = 0.5 + 0.5*coverage        // hard ceiling for the pair
+//	weighted  = 0.60*hist + 0.28*ident + 0.08*name + 0.04*recv, capped at cap
+//	shape     = cap * (0.75 + 0.25*ident) // only when shape hashes are equal
+//	score     = max(weighted, shape)
 func similarity(oldDecl, newDecl model.Declaration) (float64, []Evidence) {
-	hist := histSimilarity(oldDecl.TokenHist, newDecl.TokenHist)
-	ident := histSimilarity(oldDecl.IdentSet, newDecl.IdentSet)
+	hist, histInter, histUnion := histSimilarity(oldDecl.TokenHist, newDecl.TokenHist)
+	ident, identInter, identUnion := histSimilarity(oldDecl.IdentSet, newDecl.IdentSet)
+	sizeOld, sizeNew := nodeCount(oldDecl.TokenHist), nodeCount(newDecl.TokenHist)
+	minSize := sizeOld
+	if sizeNew < minSize {
+		minSize = sizeNew
+	}
+	coverage := float64(minSize) / fullCoverageNodes
+	if coverage > 1 {
+		coverage = 1
+	}
+	capScore := 0.5 + 0.5*coverage
+
 	nameEq := 0.0
 	if oldDecl.Name == newDecl.Name {
 		nameEq = 1
 	}
 	recvEq := 0.0
-	if oldDecl.Receiver == newDecl.Receiver {
+	if oldDecl.Receiver != "" && oldDecl.Receiver == newDecl.Receiver {
 		recvEq = 1
 	}
-	score := 0.55*hist + 0.25*ident + 0.10*nameEq + 0.05*recvEq + 0.05
+
 	evid := []Evidence{
-		{Kind: "structure", Detail: "AST node-type histogram similarity", Score: round4(hist)},
-		{Kind: "identifiers", Detail: "identifier usage similarity", Score: round4(ident)},
-	}
-	if oldDecl.ShapeHash == newDecl.ShapeHash {
-		score = math.Max(score, 0.95)
-		evid = append(evid, Evidence{Kind: "shape", Detail: "identical structure modulo declared name", Score: 1})
+		{Kind: "structure", Detail: fmt.Sprintf("AST node-type histograms share %d of %d nodes", histInter, histUnion), Score: round4(hist)},
+		{Kind: "identifiers", Detail: fmt.Sprintf("shared %d of %d identifier uses", identInter, identUnion), Score: round4(ident)},
+		{Kind: "coverage", Detail: fmt.Sprintf("structural size %d and %d nodes (coverage %.2f)", sizeOld, sizeNew, coverage), Score: round4(coverage)},
 	}
 	if nameEq == 1 {
 		evid = append(evid, Evidence{Kind: "name", Detail: "same symbol name", Score: 1})
 	}
-	if recvEq == 1 && oldDecl.Receiver != "" {
+	if recvEq == 1 {
 		evid = append(evid, Evidence{Kind: "receiver", Detail: "same receiver type " + oldDecl.Receiver, Score: 1})
+	}
+
+	weighted := 0.60*hist + 0.28*ident + 0.08*nameEq + 0.04*recvEq
+	if weighted > capScore {
+		weighted = capScore
+	}
+	score := weighted
+	if oldDecl.ShapeHash == newDecl.ShapeHash {
+		shapeScore := capScore * (0.75 + 0.25*ident)
+		evid = append(evid, Evidence{
+			Kind:   "shape",
+			Detail: fmt.Sprintf("identical structure modulo declared name over %d nodes", minSize),
+			Score:  round4(shapeScore),
+		})
+		if shapeScore > score {
+			score = shapeScore
+		}
 	}
 	return score, evid
 }
 
-// histSimilarity is a weighted Jaccard index over count maps.
-func histSimilarity(a, b map[string]int) float64 {
-	if len(a) == 0 && len(b) == 0 {
-		return 1
+// fullCoverageNodes is the declaration size (AST node count) at which
+// structural evidence is considered fully covered.
+const fullCoverageNodes = 16
+
+// nodeCount sums a token histogram into a total AST node count.
+func nodeCount(hist map[string]int) int {
+	total := 0
+	for _, n := range hist {
+		total += n
 	}
-	inter, union := 0, 0
+	return total
+}
+
+// histSimilarity is a weighted Jaccard index over count maps; it also
+// reports the intersection and union sizes for verifiable evidence.
+func histSimilarity(a, b map[string]int) (sim float64, inter, union int) {
 	for k, av := range a {
 		bv := b[k]
 		if av < bv {
@@ -315,9 +369,9 @@ func histSimilarity(a, b map[string]int) float64 {
 		}
 	}
 	if union == 0 {
-		return 1
+		return 1, 0, 0
 	}
-	return float64(inter) / float64(union)
+	return float64(inter) / float64(union), inter, union
 }
 
 func round4(f float64) float64 {

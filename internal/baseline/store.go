@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -48,7 +49,7 @@ type Store struct {
 // crash mid-commit can never pollute later comparisons.
 func Open(dir string) (*Store, error) {
 	s := &Store{dir: dir}
-	for _, sub := range []string{"baselines", "cache"} {
+	for _, sub := range []string{"baselines", filepath.Join("cache", cacheSchemaVersion)} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
 			return nil, err
 		}
@@ -62,19 +63,22 @@ func Open(dir string) (*Store, error) {
 	return s, nil
 }
 
-// cleanTemp removes unfinished writes from interrupted commits.
+// cleanTemp removes unfinished writes from interrupted commits,
+// including residue inside the versioned cache directories.
 func (s *Store) cleanTemp() error {
 	for _, sub := range []string{"baselines", "cache"} {
-		entries, err := os.ReadDir(filepath.Join(s.dir, sub))
+		root := filepath.Join(s.dir, sub)
+		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() && strings.Contains(d.Name(), ".tmp") {
+				return os.Remove(p)
+			}
+			return nil
+		})
 		if err != nil {
 			return err
-		}
-		for _, e := range entries {
-			if strings.Contains(e.Name(), ".tmp") {
-				if err := os.Remove(filepath.Join(s.dir, sub, e.Name())); err != nil {
-					return err
-				}
-			}
 		}
 	}
 	headTmp := filepath.Join(s.dir, "HEAD.tmp")
@@ -211,5 +215,5 @@ func (s *Store) SetHead(id string) error {
 
 // Cache returns the parse cache associated with this store.
 func (s *Store) Cache() *Cache {
-	return &Cache{dir: filepath.Join(s.dir, "cache")}
+	return &Cache{dir: filepath.Join(s.dir, "cache", cacheSchemaVersion)}
 }
