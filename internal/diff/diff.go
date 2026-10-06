@@ -2,6 +2,7 @@
 package diff
 
 import (
+	"fmt"
 	"math"
 	"sort"
 
@@ -38,6 +39,9 @@ type Entry struct {
 	Confidence float64    `json:"confidence,omitempty"`
 	Evidence   []Evidence `json:"evidence,omitempty"`
 	Candidate  bool       `json:"candidate,omitempty"`
+	// Note explains, in a distinguishable way, why an entry landed in
+	// candidate matching instead of a confident classification.
+	Note string `json:"note,omitempty"`
 }
 
 // Report is the full, deterministically ordered diff result.
@@ -50,17 +54,26 @@ type Report struct {
 type Options struct {
 	MatchThreshold     float64
 	CandidateThreshold float64
+	// MinEvidenceNodes is the minimum structural-evidence mass (count of
+	// AST nodes, identifiers and literals of the smaller side) required
+	// for a high-confidence rename/move verdict. Smaller symbols can
+	// still match, but their confidence is capped below MatchThreshold
+	// and they are reported as candidates. Zero selects the default.
+	MinEvidenceNodes int
 }
 
 // DefaultOptions returns the default thresholds.
 func DefaultOptions() Options {
-	return Options{MatchThreshold: 0.85, CandidateThreshold: 0.5}
+	return Options{MatchThreshold: 0.85, CandidateThreshold: 0.5, MinEvidenceNodes: 20}
 }
 
 // DiffTrees compares two tree models and classifies every declaration.
 func DiffTrees(oldTree, newTree *model.TreeModel, opts Options) *Report {
 	if opts.MatchThreshold == 0 {
 		opts = DefaultOptions()
+	}
+	if opts.MinEvidenceNodes <= 0 {
+		opts.MinEvidenceNodes = DefaultOptions().MinEvidenceNodes
 	}
 	d := &differ{opts: opts}
 	d.index(oldTree, newTree)
@@ -77,6 +90,7 @@ type pair struct {
 	new   model.Declaration
 	score float64
 	evid  []Evidence
+	nodes int
 }
 
 type differ struct {
@@ -154,9 +168,9 @@ func (d *differ) matchSimilar() {
 			if r.Kind != a.Kind {
 				continue
 			}
-			score, evid := similarity(r, a)
+			score, evid, nodes := similarity(r, a)
 			if score >= d.opts.CandidateThreshold {
-				pairs = append(pairs, pair{old: r, new: a, score: score, evid: evid})
+				pairs = append(pairs, pair{old: r, new: a, score: score, evid: evid, nodes: nodes})
 			}
 		}
 	}
@@ -195,15 +209,30 @@ func (d *differ) matchSimilar() {
 }
 
 // addMatch emits a rename/move (or candidate) entry for a matched pair.
+// Confidence is capped below the match threshold when the evidence mass
+// is too small to support a high-confidence verdict, unless the content
+// is token-for-token identical (which is decisive at any size).
 func (d *differ) addMatch(p pair) {
-	candidate := p.score < d.opts.MatchThreshold
+	score := p.score
+	var note string
+	exact := p.old.ExactHash == p.new.ExactHash
+	if !exact && p.nodes < d.opts.MinEvidenceNodes && score >= d.opts.MatchThreshold {
+		score = d.opts.MatchThreshold - 0.01
+		note = fmt.Sprintf("insufficient structural evidence: only %d evidence nodes (need %d); confidence capped below match threshold",
+			p.nodes, d.opts.MinEvidenceNodes)
+	}
+	candidate := score < d.opts.MatchThreshold
+	if candidate && note == "" {
+		note = fmt.Sprintf("best-effort match: score %.4f below match threshold %.2f", score, d.opts.MatchThreshold)
+	}
 	e := Entry{
 		Kind:       p.new.Kind,
 		Name:       p.new.Name,
 		File:       p.new.File,
-		Confidence: round4(p.score),
+		Confidence: round4(score),
 		Evidence:   p.evid,
 		Candidate:  candidate,
+		Note:       note,
 	}
 	switch {
 	case p.old.File != p.new.File:
@@ -263,8 +292,21 @@ func symbolName(d model.Declaration) string {
 
 // similarity scores how likely two declarations are the same symbol.
 // Name equality alone is deliberately weak: structurally unrelated
-// same-name symbols must never reach the match threshold.
-func similarity(oldDecl, newDecl model.Declaration) (float64, []Evidence) {
+// same-name symbols must never reach the match threshold. The returned
+// nodes value is the evidence mass (profile size of the smaller side),
+// used to cap confidence when there is too little structure to judge.
+func similarity(oldDecl, newDecl model.Declaration) (score float64, evid []Evidence, nodes int) {
+	nodes = min(profileSize(oldDecl), profileSize(newDecl))
+
+	// Token-for-token identical content (modulo formatting/comments)
+	// is decisive regardless of symbol size: it cannot be a
+	// coincidence of shape.
+	if oldDecl.ExactHash == newDecl.ExactHash {
+		return 1.0, []Evidence{
+			{Kind: "exact", Detail: "identical token stream modulo formatting", Score: 1},
+		}, nodes
+	}
+
 	hist := histSimilarity(oldDecl.TokenHist, newDecl.TokenHist)
 	ident := histSimilarity(oldDecl.IdentSet, newDecl.IdentSet)
 	nameEq := 0.0
@@ -275,8 +317,8 @@ func similarity(oldDecl, newDecl model.Declaration) (float64, []Evidence) {
 	if oldDecl.Receiver == newDecl.Receiver {
 		recvEq = 1
 	}
-	score := 0.55*hist + 0.25*ident + 0.10*nameEq + 0.05*recvEq + 0.05
-	evid := []Evidence{
+	score = 0.55*hist + 0.25*ident + 0.10*nameEq + 0.05*recvEq
+	evid = []Evidence{
 		{Kind: "structure", Detail: "AST node-type histogram similarity", Score: round4(hist)},
 		{Kind: "identifiers", Detail: "identifier usage similarity", Score: round4(ident)},
 	}
@@ -290,7 +332,17 @@ func similarity(oldDecl, newDecl model.Declaration) (float64, []Evidence) {
 	if recvEq == 1 && oldDecl.Receiver != "" {
 		evid = append(evid, Evidence{Kind: "receiver", Detail: "same receiver type " + oldDecl.Receiver, Score: 1})
 	}
-	return score, evid
+	return score, evid, nodes
+}
+
+// profileSize is the structural-evidence mass of a declaration: the
+// total count of AST nodes, identifiers and literals in its profile.
+func profileSize(d model.Declaration) int {
+	n := 0
+	for _, c := range d.TokenHist {
+		n += c
+	}
+	return n
 }
 
 // histSimilarity is a weighted Jaccard index over count maps.

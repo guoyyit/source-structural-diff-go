@@ -113,3 +113,93 @@ func Bar(x int) int { return x * 2 }
 		t.Fatal("exact hash must change across rename")
 	}
 }
+
+// Redundant parentheses, nested or not, must never change declaration
+// fingerprints; whitespace and comments on top must not matter either.
+func TestParenInvariance(t *testing.T) {
+	base := `package p
+func F(a, b int) int {
+	return a + b
+}
+func G(x int) int {
+	if x > 0 {
+		return x
+	}
+	return -x
+}
+`
+	variants := []string{
+		`package p
+func F(a, b int) int {
+	return (a + b)
+}
+func G(x int) int {
+	if (x > 0) {
+		return (x)
+	}
+	return -(x)
+}
+`,
+		`package p
+func F(a, b int) int {
+	return ((a + b))
+}
+func G(x int) int {
+	if ((x > 0)) {
+		return ((x))
+	}
+	return -((x))
+}
+`,
+		// Mixed with comments and weird formatting.
+		`package   p
+func F(a, b int) int {
+	// add them
+	return (((a))) + (b) /* trailing */
+}
+func G(x int) int {
+	if (x) > (0) {
+		return x
+	}
+	return -(x)
+}
+`,
+	}
+	fBase, err := ParseFile("a.go", []byte(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range variants {
+		fv, err := ParseFile("a.go", []byte(v))
+		if err != nil {
+			t.Fatalf("variant %d: %v", i, err)
+		}
+		if len(fv.Decls) != len(fBase.Decls) {
+			t.Fatalf("variant %d: decl count differs", i)
+		}
+		for j := range fBase.Decls {
+			if fBase.Decls[j].ExactHash != fv.Decls[j].ExactHash {
+				t.Errorf("variant %d decl %s: exact hash changed by redundant parens", i, fBase.Decls[j].Name)
+			}
+			if fBase.Decls[j].ShapeHash != fv.Decls[j].ShapeHash {
+				t.Errorf("variant %d decl %s: shape hash changed by redundant parens", i, fBase.Decls[j].Name)
+			}
+		}
+	}
+}
+
+// Parentheses that change evaluation order change semantics and must
+// still produce different fingerprints.
+func TestParenSemanticsPreserved(t *testing.T) {
+	src1 := `package p
+func F(a, b, c int) int { return a * (b + c) }
+`
+	src2 := `package p
+func F(a, b, c int) int { return a * b + c }
+`
+	f1, _ := ParseFile("a.go", []byte(src1))
+	f2, _ := ParseFile("a.go", []byte(src2))
+	if f1.Decls[0].ExactHash == f2.Decls[0].ExactHash {
+		t.Fatal("semantically different parenthesization must differ")
+	}
+}

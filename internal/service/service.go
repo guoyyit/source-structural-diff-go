@@ -25,6 +25,10 @@ type ProgressEvent struct {
 	Total    int           // total files discovered
 	Duration time.Duration // parse duration for "file"/"slow"
 	Baseline string        // baseline ID for "commit"
+	// Parsed reports whether the file was actually parsed in this run
+	// (false when its model was reused unchanged). Observers can use it
+	// to verify that incremental commits never re-parse untouched files.
+	Parsed bool
 }
 
 // ProgressFunc receives progress events; it may be nil.
@@ -213,23 +217,36 @@ func (s *Service) buildTree(ctx context.Context, root string, prev *model.TreeMo
 
 	tree := &model.TreeModel{Files: map[string]*model.FileModel{}}
 	done := 0
+	// On failure or cancellation the loop keeps draining results until
+	// the channel closes: workers finish their in-flight job, observe
+	// the cancelled context and exit, so no goroutine is ever left
+	// blocked on a send nobody reads.
+	var retErr error
 	for res := range results {
-		done++
+		if retErr != nil {
+			continue
+		}
 		if res.err != nil {
 			cancel()
-			return nil, res.err
+			retErr = res.err
+			continue
 		}
 		if err := ctx.Err(); err != nil {
 			cancel()
-			return nil, err
+			retErr = err
+			continue
 		}
+		done++
 		tree.Files[res.fm.Path] = res.fm
-		ev := ProgressEvent{Kind: "file", Path: res.fm.Path, Done: done, Total: len(files), Duration: res.duration}
+		ev := ProgressEvent{Kind: "file", Path: res.fm.Path, Done: done, Total: len(files), Duration: res.duration, Parsed: res.parsed}
 		s.report(ev)
 		if res.parsed && res.duration > s.opts.SlowFileThreshold {
 			ev.Kind = "slow"
 			s.report(ev)
 		}
+	}
+	if retErr != nil {
+		return nil, retErr
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

@@ -108,6 +108,76 @@ func TestCrashRecovery(t *testing.T) {
 	}
 }
 
+// After a crash and recovery, every committed baseline in the chain
+// must stay loadable — none lost, none duplicated — and recommitting
+// known content reproduces the exact same baseline IDs.
+func TestRecoveryPreservesChainAndReproducibility(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	parent := ""
+	for _, v := range []string{"v1", "v2", "v3"} {
+		id, err := s.Commit(&Baseline{Parent: parent, Tree: testTree(v)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetHead(id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+		parent = id
+	}
+	// Crash residue: an unfinished fourth commit plus temp files.
+	if _, err := s.Commit(&Baseline{Parent: parent, Tree: testTree("v4-unfinished")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cache", "stale.tmp9"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := s2.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != len(ids) {
+		t.Fatalf("recovered chain has %d entries, want %d: %v", len(listed), len(ids), listed)
+	}
+	seen := map[string]bool{}
+	for _, id := range listed {
+		if seen[id] {
+			t.Fatalf("duplicate entry after recovery: %s", id)
+		}
+		seen[id] = true
+		if _, err := s2.Load(id); err != nil {
+			t.Fatalf("committed baseline lost after recovery: %s: %v", id, err)
+		}
+	}
+	for _, id := range ids {
+		if !seen[id] {
+			t.Fatalf("committed baseline %s missing after recovery", id)
+		}
+	}
+	// Recommitting the same chain reproduces identical IDs.
+	parent = ""
+	for i, v := range []string{"v1", "v2", "v3"} {
+		id, err := s2.Commit(&Baseline{Parent: parent, Tree: testTree(v)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id != ids[i] {
+			t.Fatalf("recommit not reproducible: got %s want %s", id, ids[i])
+		}
+		parent = id
+	}
+}
+
 func TestCacheRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)

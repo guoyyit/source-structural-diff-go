@@ -117,6 +117,21 @@ func TestModifiedAndUnchanged(t *testing.T) {
 	}
 }
 
+// Adding or removing only redundant parentheses (nested included),
+// possibly together with comment/whitespace churn, is not a change.
+func TestRedundantParensUnchanged(t *testing.T) {
+	oldT := treeOf(t, map[string]string{
+		"a.go": "package p\n\n// Compute returns a value.\nfunc Compute(a, b, c int) int {\n\treturn a*(b+c) - (a + b)\n}\n",
+	})
+	newT := treeOf(t, map[string]string{
+		"a.go": "package   p\n\nfunc Compute(a, b, c int) int {\n\t// rewritten with extra parens\n\treturn (a)*((b + c)) - ((a) + (b))\n}\n",
+	})
+	rep := DiffTrees(oldT, newT, DefaultOptions())
+	if len(rep.Entries) != 1 || rep.Entries[0].Category != Unchanged {
+		t.Fatalf("redundant parens must be unchanged, got %+v", rep.Entries)
+	}
+}
+
 func TestCandidateOnWeakEvidence(t *testing.T) {
 	oldT := treeOf(t, map[string]string{
 		"a.go": "package p\nfunc Process(data []int) int {\n\ttotal := 0\n\tfor _, v := range data {\n\t\ttotal += v * 2\n\t}\n\treturn total\n}\n",
@@ -134,6 +149,97 @@ func TestCandidateOnWeakEvidence(t *testing.T) {
 	}
 	if renamed[0].Confidence >= 0.85 {
 		t.Fatalf("candidate confidence too high: %+v", renamed[0])
+	}
+	if renamed[0].Note == "" {
+		t.Fatalf("candidate must carry a distinguishable note: %+v", renamed[0])
+	}
+}
+
+// A tiny symbol whose only difference is parameter naming has too
+// little structural evidence for a high-confidence move verdict, even
+// though its normalized shape matches exactly.
+func TestSmallSymbolMoveCapped(t *testing.T) {
+	oldT := treeOf(t, map[string]string{
+		"a.go": "package p\nfunc add(a, b int) int { return a + b }\n",
+	})
+	newT := treeOf(t, map[string]string{
+		"sub/b.go": "package p\nfunc sum(x, y int) int { return x + y }\n",
+	})
+	rep := DiffTrees(oldT, newT, DefaultOptions())
+	for _, e := range rep.Entries {
+		if e.Category == Moved || e.Category == Renamed {
+			if !e.Candidate {
+				t.Fatalf("tiny symbol must not get high-confidence move: %+v", e)
+			}
+			if e.Confidence >= 0.85 {
+				t.Fatalf("tiny symbol confidence must be capped: %+v", e)
+			}
+			if e.Note == "" {
+				t.Fatalf("capped candidate must explain itself: %+v", e)
+			}
+		}
+	}
+}
+
+// The same tiny symbol moved verbatim (token-for-token identical) is
+// decisive evidence and keeps full confidence despite its size.
+func TestTinySymbolExactMoveConfident(t *testing.T) {
+	src := "package p\nfunc add(a, b int) int { return a + b }\n"
+	oldT := treeOf(t, map[string]string{"a.go": src})
+	newT := treeOf(t, map[string]string{"sub/b.go": src})
+	rep := DiffTrees(oldT, newT, DefaultOptions())
+	moved := entriesByCategory(rep, Moved)
+	if len(moved) != 1 {
+		t.Fatalf("want 1 move, got %+v", rep.Entries)
+	}
+	if moved[0].Candidate || moved[0].Confidence < 0.85 {
+		t.Fatalf("exact move must stay confident: %+v", moved[0])
+	}
+	hasExact := false
+	for _, ev := range moved[0].Evidence {
+		if ev.Kind == "exact" {
+			hasExact = true
+		}
+	}
+	if !hasExact {
+		t.Fatalf("exact move must cite exact evidence: %+v", moved[0])
+	}
+}
+
+// Same-name symbols with genuinely unrelated structure must not be
+// paired as rename/move even when both are methods on equally named
+// receivers; they stay add+delete or, at most, a flagged candidate.
+func TestSameNameUnrelatedNeverConfident(t *testing.T) {
+	oldT := treeOf(t, map[string]string{
+		"a.go": "package p\nfunc (s *Store) Load(key string) (string, error) {\n\trow := s.db.QueryRow(key)\n\tvar v string\n\tif err := row.Scan(&v); err != nil {\n\t\treturn \"\", err\n\t}\n\treturn v, nil\n}\n",
+	})
+	newT := treeOf(t, map[string]string{
+		"b.go": "package p\nfunc (s *Store) Load(cfg []byte) error {\n\tdec := json.NewDecoder(bytes.NewReader(cfg))\n\tfor {\n\t\tvar kv map[string]string\n\t\tif err := dec.Decode(&kv); err != nil {\n\t\t\tbreak\n\t\t}\n\t\ts.Apply(kv)\n\t}\n\treturn nil\n}\n",
+	})
+	rep := DiffTrees(oldT, newT, DefaultOptions())
+	for _, e := range rep.Entries {
+		if (e.Category == Moved || e.Category == Renamed) && !e.Candidate {
+			t.Fatalf("unrelated same-name methods must not be confidently matched: %+v", e)
+		}
+	}
+}
+
+// A large renamed symbol with identical normalized shape keeps high
+// confidence: coverage is sufficient there.
+func TestLargeRenameStaysConfident(t *testing.T) {
+	oldT := treeOf(t, map[string]string{
+		"a.go": "package p\nfunc ComputeTotal(items []int) int {\n\tsum := 0\n\tfor _, v := range items {\n\t\tsum += v\n\t}\n\treturn sum\n}\n",
+	})
+	newT := treeOf(t, map[string]string{
+		"sub/b.go": "package p\nfunc SumAll(values []int) int {\n\tsum := 0\n\tfor _, v := range values {\n\t\tsum += v\n\t}\n\treturn sum\n}\n",
+	})
+	rep := DiffTrees(oldT, newT, DefaultOptions())
+	moved := entriesByCategory(rep, Moved)
+	if len(moved) != 1 {
+		t.Fatalf("want 1 move, got %+v", rep.Entries)
+	}
+	if moved[0].Candidate || moved[0].Confidence < 0.85 {
+		t.Fatalf("well-covered rename+move must stay confident: %+v", moved[0])
 	}
 }
 

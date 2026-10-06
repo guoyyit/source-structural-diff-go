@@ -239,6 +239,13 @@ func dumpHash(node ast.Node, normalize map[string]bool, tokHist, identSet map[st
 		if n == nil {
 			return true
 		}
+		if _, ok := n.(*ast.ParenExpr); ok {
+			// Parentheses are purely syntactic grouping: the AST
+			// shape already encodes precedence, so (x), ((x)) and x
+			// are semantically identical. Skip the node itself but
+			// keep walking its contents.
+			return true
+		}
 		switch x := n.(type) {
 		case *ast.Ident:
 			name := x.Name
